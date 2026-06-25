@@ -1,1 +1,1471 @@
-print(<>)
+import os
+import sys
+import re
+import subprocess
+import threading
+from datetime import datetime
+from typing import List, Optional, Tuple, Dict, Any
+from dataclasses import dataclass, field
+from enum import Enum
+
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext, filedialog
+
+# Netmiko handling with proper error management
+def install_netmiko():
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "netmiko", "--quiet"])
+        return True
+    except Exception as e:
+        print(f"Failed to install netmiko: {e}")
+        return False
+
+try:
+    from netmiko import ConnectHandler, NetmikoTimeoutException, NetmikoAuthenticationException
+except ImportError:
+    print("Netmiko not found. Installing...")
+    if install_netmiko():
+        from netmiko import ConnectHandler, NetmikoTimeoutException, NetmikoAuthenticationException
+    else:
+        messagebox.showerror("Error", "Failed to install required library 'netmiko'. Please install manually: pip install netmiko")
+        sys.exit(1)
+
+# ==================== THEME SYSTEM ====================
+class Theme:
+    DARK = {
+        'bg_primary': '#0a0a0f', 'bg_secondary': '#12121c', 'bg_tertiary': '#1a1a28',
+        'bg_card': '#222233', 'bg_input': '#2a2a3d', 'bg_hover': '#353550', 'bg_button': '#2d2d44',
+        'neon_cyan': '#00f7ff', 'neon_pink': '#ff2a7a', 'neon_purple': '#d400ff',
+        'neon_green': '#00ff9d', 'neon_yellow': '#ffeb3b', 'neon_orange': '#ff9100',
+        'neon_red': '#ff4757', 'neon_blue': '#3742fa',
+        'text_primary': '#ffffff', 'text_secondary': '#c8c8d8', 'text_tertiary': '#8888a0',
+        'text_disabled': '#555566', 'border': '#3a3a55', 'border_focus': '#00f7ff',
+        'success': '#00ff9d', 'error': '#ff4757', 'warning': '#ffeb3b',
+    }
+    LIGHT = {
+        'bg_primary': '#f0f2f5', 'bg_secondary': '#ffffff', 'bg_tertiary': '#e8eaed',
+        'bg_card': '#ffffff', 'bg_input': '#f1f3f4', 'bg_hover': '#e4e6eb', 'bg_button': '#e8eaed',
+        'neon_cyan': '#0088cc', 'neon_pink': '#e6005c', 'neon_purple': '#9900cc',
+        'neon_green': '#00aa66', 'neon_yellow': '#cc9900', 'neon_orange': '#cc7000',
+        'neon_red': '#cc0000', 'neon_blue': '#2c3e50',
+        'text_primary': '#1a1a2e', 'text_secondary': '#4a4a6a', 'text_tertiary': '#5a5a7a',
+        'text_disabled': '#888888', 'border': '#dadce0', 'border_focus': '#0088cc',
+        'success': '#00aa66', 'error': '#cc0000', 'warning': '#cc9900',
+    }
+
+@dataclass
+class Device:
+    ip: str
+    username: str
+    password: str
+    enable_secret: str = ""
+    port: int = 22
+    connection = None
+    is_connected: bool = False
+    hostname: str = "Unknown"
+    interfaces: List[str] = field(default_factory=list)
+    def get_type(self):
+        return "cisco_ios"
+
+# ==================== COMMAND GENERATORS ====================
+class CommandGenerator:
+    @staticmethod
+    def get_interfaces() -> str:
+        return "show ip interface brief"
+    @staticmethod
+    def configure_static(routes: List[Tuple]) -> List[str]:
+        cmds = []
+        for net, mask, next_hop, admin_dist in routes:
+            if not net or not next_hop: continue
+            if admin_dist and admin_dist != "1":
+                cmds.append(f"ip route {net} {mask} {next_hop} {admin_dist}")
+            else:
+                cmds.append(f"ip route {net} {mask} {next_hop}")
+        return cmds
+    @staticmethod
+    def configure_default(next_hop: str, intf: str = "") -> List[str]:
+        if intf and intf.strip():
+            return [f"ip route 0.0.0.0 0.0.0.0 {intf}"]
+        return [f"ip route 0.0.0.0 0.0.0.0 {next_hop}"]
+    @staticmethod
+    def configure_ospf(pid: str, rid: str, networks: List[Tuple]) -> List[str]:
+        cmds = [f"router ospf {pid}"]
+        if rid.strip(): cmds.append(f"router-id {rid}")
+        for net, wild, area in networks:
+            if net.strip() and wild.strip() and area.strip():
+                cmds.append(f"network {net} {wild} area {area}")
+        return cmds
+    @staticmethod
+    def configure_eigrp(as_num: str, networks: List[Tuple], auto_sum: bool) -> List[str]:
+        cmds = [f"router eigrp {as_num}"]
+        if not auto_sum: cmds.append("no auto-summary")
+        for net, wild in networks:
+            if net.strip() and wild.strip(): cmds.append(f"network {net} {wild}")
+        return cmds
+    @staticmethod
+    def configure_rip(networks: List[str]) -> List[str]:
+        cmds = ["router rip", "version 2", "no auto-summary"]
+        for net in networks:
+            if net.strip(): cmds.append(f"network {net}")
+        return cmds
+    @staticmethod
+    def create_vlan(vid: str, name: str) -> List[str]:
+        return [f"vlan {vid}", f"name {name}"]
+    @staticmethod
+    def configure_interface(intf: str, mode: str, ip: str = None, mask: str = None, vlan: str = None) -> List[str]:
+        cmds = [f"interface {intf}"]
+        if mode == "routed":
+            cmds.append("no switchport")
+            if ip and ip.strip() and mask and mask.strip(): cmds.append(f"ip address {ip} {mask}")
+        elif mode == "access":
+            cmds.extend(["switchport mode access", f"switchport access vlan {vlan}"])
+        elif mode == "trunk": cmds.append("switchport mode trunk")
+        cmds.append("no shutdown")
+        return cmds
+    @staticmethod
+    def interface_shutdown(intf: str, shutdown: bool) -> List[str]:
+        return [f"interface {intf}", "shutdown" if shutdown else "no shutdown"]
+    @staticmethod
+    def save_config() -> str:
+        return "write memory"
+    # DELETE COMMANDS
+    @staticmethod
+    def delete_ospf(pid: str) -> List[str]:
+        return [f"no router ospf {pid}"]
+    @staticmethod
+    def delete_ospf_network(pid: str, network: str, wildcard: str, area: str) -> List[str]:
+        return [f"router ospf {pid}", f"no network {network} {wildcard} area {area}"]
+    @staticmethod
+    def delete_ospf_router_id(pid: str) -> List[str]:
+        return [f"router ospf {pid}", "no router-id"]
+    @staticmethod
+    def delete_eigrp(as_num: str) -> List[str]:
+        return [f"no router eigrp {as_num}"]
+    @staticmethod
+    def delete_eigrp_network(as_num: str, network: str, wildcard: str) -> List[str]:
+        return [f"router eigrp {as_num}", f"no network {network} {wildcard}"]
+    @staticmethod
+    def delete_rip() -> List[str]:
+        return ["no router rip"]
+    @staticmethod
+    def delete_rip_network(network: str) -> List[str]:
+        return ["router rip", f"no network {network}"]
+    @staticmethod
+    def delete_static(routes: List[Tuple]) -> List[str]:
+        cmds = []
+        for net, mask, next_hop in routes:
+            if not net or not next_hop: continue
+            cmds.append(f"no ip route {net} {mask} {next_hop}")
+        return cmds
+    @staticmethod
+    def delete_default(next_hop: str, intf: str = "") -> List[str]:
+        if intf and intf.strip():
+            return [f"no ip route 0.0.0.0 0.0.0.0 {intf}"]
+        return [f"no ip route 0.0.0.0 0.0.0.0 {next_hop}"]
+    @staticmethod
+    def delete_vlan(vid: str) -> List[str]:
+        return [f"no vlan {vid}"]
+    @staticmethod
+    def delete_interface_ip(intf: str) -> List[str]:
+        return [f"interface {intf}", "no ip address"]
+    @staticmethod
+    def delete_interface_ip_specific(intf: str, ip: str, mask: str) -> List[str]:
+        if ip.strip() and mask.strip():
+            return [f"interface {intf}", f"no ip address {ip} {mask}"]
+        return [f"interface {intf}", "no ip address"]
+    @staticmethod
+    def reset_interface(intf: str) -> List[str]:
+        return [f"default interface {intf}"]
+
+# ==================== SSH MANAGER ====================
+class SSHManager:
+    def __init__(self):
+        self.device: Optional[Device] = None
+        self.history: List[Dict] = []
+        self.lock = threading.Lock()
+    def connect(self, device: Device) -> Tuple[bool, str]:
+        try:
+            params = {'device_type': device.get_type(), 'host': device.ip,
+                      'username': device.username, 'password': device.password,
+                      'port': device.port, 'timeout': 30}
+            if device.enable_secret: params['secret'] = device.enable_secret
+            device.connection = ConnectHandler(**params)
+            if device.enable_secret: device.connection.enable()
+            prompt = device.connection.find_prompt()
+            device.hostname = prompt.replace('#', '').replace('>', '').strip()
+            intf_cmd = CommandGenerator.get_interfaces()
+            output = device.connection.send_command(intf_cmd)
+            device.interfaces = self._parse_interfaces(output)
+            device.is_connected = True
+            self.device = device
+            with self.lock:
+                self.history.append({'time': datetime.now().strftime("%H:%M:%S"),
+                                     'ip': device.ip, 'hostname': device.hostname})
+            return True, f"Connected to {device.hostname} ({device.ip})"
+        except NetmikoAuthenticationException:
+            return False, "Authentication failed - check username/password"
+        except NetmikoTimeoutException:
+            return False, "Connection timeout - check IP and port"
+        except Exception as e:
+            return False, f"Connection error: {str(e)}"
+    def disconnect(self):
+        if self.device and self.device.connection:
+            try: self.device.connection.disconnect()
+            except: pass
+            self.device.is_connected = False
+            self.device = None
+    def execute(self, command: str) -> Tuple[bool, str]:
+        if not self.device or not self.device.is_connected:
+            return False, "Not connected to any device"
+        try:
+            output = self.device.connection.send_command(command)
+            return True, output
+        except Exception as e:
+            return False, str(e)
+    def config_set(self, commands: List[str]) -> Tuple[bool, str]:
+        if not self.device or not self.device.is_connected:
+            return False, "Not connected to any device"
+        try:
+            output = self.device.connection.send_config_set(commands)
+            return True, output
+        except Exception as e:
+            return False, str(e)
+    def _parse_interfaces(self, output: str) -> List[str]:
+        interfaces = []
+        lines = output.split('\n')
+        for line in lines[1:]:
+            parts = line.split()
+            if parts and not parts[0].startswith('Interface') and not parts[0].startswith('---'):
+                interfaces.append(parts[0])
+        return interfaces
+
+# ==================== CUSTOM WIDGETS ====================
+class StyledButton(tk.Button):
+    def __init__(self, parent, text, command=None, color='neon_cyan', width=15, **kwargs):
+        self.colors = parent.colors if hasattr(parent, 'colors') else Theme.DARK
+        self.color_key = color
+        self.base_color = self.colors.get(color, '#00f7ff')
+        super().__init__(parent, text=text, command=command, bg=self.base_color,
+                         fg=self.colors['bg_primary'], font=('Segoe UI', 11, 'bold'),
+                         relief='flat', cursor='hand2', width=width,
+                         activebackground=self._lighten(self.base_color),
+                         activeforeground=self.colors['bg_primary'], **kwargs)
+        self.bind('<Enter>', lambda e: self.config(bg=self._lighten(self.base_color)))
+        self.bind('<Leave>', lambda e: self.config(bg=self.base_color))
+    def _lighten(self, hex_color, factor=1.3):
+        try:
+            hex_color = hex_color.lstrip('#')
+            rgb = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+            new_rgb = tuple(min(int(c * factor), 255) for c in rgb)
+            return f'#{new_rgb[0]:02x}{new_rgb[1]:02x}{new_rgb[2]:02x}'
+        except: return hex_color
+
+class StyledEntry(tk.Frame):
+    def __init__(self, parent, placeholder="", show=None, width=25, colors=None, **kwargs):
+        self.colors = colors if colors else (parent.colors if hasattr(parent, 'colors') else Theme.DARK)
+        super().__init__(parent, bg=self.colors['bg_card'])
+        self.var = tk.StringVar()
+        self.placeholder = placeholder
+        self.show_char = show
+        self.is_placeholder = True
+        self.entry = tk.Entry(self, textvariable=self.var, bg=self.colors['bg_input'],
+                              fg=self.colors['text_tertiary'], insertbackground=self.colors['neon_cyan'],
+                              font=('Segoe UI', 11), relief='flat', highlightthickness=2,
+                              highlightcolor=self.colors['border_focus'],
+                              highlightbackground=self.colors['border'], width=width, **kwargs)
+        self.entry.pack(fill='x', ipady=6)
+        self.var.set(placeholder)
+        if show:
+            self.entry.bind('<FocusIn>', self._on_focus_in_password)
+            self.entry.bind('<FocusOut>', self._on_focus_out_password)
+        else:
+            self.entry.bind('<FocusIn>', self._on_focus_in)
+            self.entry.bind('<FocusOut>', self._on_focus_out)
+    def get(self):
+        return "" if self.is_placeholder else self.var.get()
+    def set(self, value):
+        self.var.set(value)
+        self.is_placeholder = False
+        self.entry.config(fg=self.colors['text_primary'])
+        if self.show_char: self.entry.config(show=self.show_char)
+    def clear(self):
+        self.var.set('')
+        self.is_placeholder = True
+        self.entry.config(fg=self.colors['text_tertiary'], show='')
+        self.entry.insert(0, self.placeholder)
+    def _on_focus_in(self, event):
+        if self.is_placeholder:
+            self.var.set('')
+            self.is_placeholder = False
+            self.entry.config(fg=self.colors['text_primary'])
+    def _on_focus_out(self, event):
+        if not self.var.get():
+            self.var.set(self.placeholder)
+            self.is_placeholder = True
+            self.entry.config(fg=self.colors['text_tertiary'])
+    def _on_focus_in_password(self, event):
+        if self.is_placeholder:
+            self.var.set('')
+            self.is_placeholder = False
+            self.entry.config(fg=self.colors['text_primary'], show=self.show_char)
+    def _on_focus_out_password(self, event):
+        if not self.var.get():
+            self.var.set(self.placeholder)
+            self.is_placeholder = True
+            self.entry.config(fg=self.colors['text_tertiary'], show='')
+
+class Card(tk.Frame):
+    def __init__(self, parent, title="", icon="", accent='neon_cyan', **kwargs):
+        self.colors = parent.colors if hasattr(parent, 'colors') else Theme.DARK
+        self.accent = accent
+        self.outer = tk.Frame(parent, bg=self.colors[accent], padx=2, pady=2)
+        tk.Frame.__init__(self, self.outer, bg=self.colors['bg_card'], **kwargs)
+        self.pack(fill='both', expand=True, padx=1, pady=1)
+        if title:
+            header = tk.Frame(self, bg=self.colors['bg_secondary'], height=45)
+            header.pack(fill='x', side='top')
+            header.pack_propagate(False)
+            tk.Label(header, text=f"{icon} {title}", bg=self.colors['bg_secondary'],
+                     fg=self.colors[accent], font=('Segoe UI', 12, 'bold'), padx=15).pack(side='left', fill='y')
+
+# ==================== MAIN APPLICATION ====================
+class CiscoProApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("SDNA 1.0.0")
+        self.root.geometry("1400x900")
+        self.current_theme = "DARK"
+        self.colors = Theme.DARK
+        self.root.configure(bg=self.colors['bg_primary'])
+        try: self.root.state('zoomed')
+        except:
+            try: self.root.attributes('-zoomed', True)
+            except: pass
+        self.ssh = SSHManager()
+        self.current_interface = None
+        self.setup_ttk_style()
+        self.setup_ui()
+
+    def setup_ttk_style(self):
+        self.style = ttk.Style()
+        self.style.theme_use('clam')
+        c = self.colors
+        self.style.configure('TNotebook', background=c['bg_primary'], borderwidth=0, tabmargins=[2, 5, 2, 0])
+        self.style.configure('TNotebook.Tab', background=c['bg_secondary'], foreground=c['text_primary'],
+                             font=('Segoe UI', 10, 'bold'), padding=[15, 8], borderwidth=0)
+        self.style.map('TNotebook.Tab',
+                       background=[('selected', c['bg_card']), ('active', c['bg_hover'])],
+                       foreground=[('selected', c['neon_cyan']), ('active', c['text_primary'])],
+                       expand=[('selected', [1, 1, 1, 0])])
+        self.style.configure('Treeview', background=c['bg_input'], foreground=c['text_primary'],
+                             fieldbackground=c['bg_input'], font=('Consolas', 10))
+        self.style.map('Treeview', background=[('selected', c['neon_cyan'])],
+                       foreground=[('selected', c['bg_primary'])])
+        self.style.configure('Vertical.TScrollbar', background=c['bg_secondary'], troughcolor=c['bg_primary'],
+                             borderwidth=0, arrowcolor=c['text_secondary'])
+        self.style.configure('Horizontal.TScrollbar', background=c['bg_secondary'], troughcolor=c['bg_primary'],
+                             borderwidth=0, arrowcolor=c['text_secondary'])
+        # Combobox styling for proper theme support
+        self.style.configure('TCombobox', fieldbackground=c['bg_input'], background=c['bg_secondary'],
+                             foreground=c['text_primary'], arrowcolor=c['text_secondary'])
+        self.style.map('TCombobox', fieldbackground=[('readonly', c['bg_input'])],
+                       selectbackground=[('readonly', c['neon_cyan'])],
+                       selectforeground=[('readonly', c['bg_primary'])])
+
+    def apply_theme(self, theme_name):
+        self.current_theme = theme_name
+        self.colors = Theme.DARK if theme_name == "DARK" else Theme.LIGHT
+        self.root.configure(bg=self.colors['bg_primary'])
+        current_panel = 0
+        for i, panel in enumerate(self.panels):
+            if panel.winfo_viewable():
+                current_panel = i
+                break
+        for widget in self.root.winfo_children(): widget.destroy()
+        self.setup_ttk_style()
+        self.setup_ui()
+        self.show_panel(current_panel)
+
+    def setup_ui(self):
+        main = tk.Frame(self.root, bg=self.colors['bg_primary'])
+        main.pack(fill='both', expand=True, padx=15, pady=15)
+        self.create_header(main)
+        content = tk.Frame(main, bg=self.colors['bg_primary'])
+        content.pack(fill='both', expand=True, pady=(20, 0))
+        self.create_sidebar(content)
+        self.main_frame = tk.Frame(content, bg=self.colors['bg_primary'])
+        self.main_frame.pack(side='left', fill='both', expand=True)
+        self.panels = []
+        self.create_settings_panel()
+        self.create_connection_panel()
+        self.create_routing_panel()
+        self.create_interface_panel()
+        self.create_vlan_panel()
+        self.create_troubleshooting_panel()
+        self.show_panel(1)
+        self.create_status_bar()
+
+    def create_header(self, parent):
+        header = tk.Frame(parent, bg=self.colors['bg_secondary'], height=85)
+        header.pack(fill='x')
+        header.pack_propagate(False)
+        logo = tk.Frame(header, bg=self.colors['bg_secondary'])
+        logo.pack(side='left', padx=30)
+        tk.Label(logo, text="⚡", bg=self.colors['bg_secondary'],
+                 fg=self.colors['neon_cyan'], font=('Segoe UI', 40)).pack(side='left')
+        title = tk.Frame(logo, bg=self.colors['bg_secondary'])
+        title.pack(side='left', padx=15)
+        tk.Label(title, text="SOFTWARE DEFINE NETWORK AUTOMATION", bg=self.colors['bg_secondary'],
+                 fg=self.colors['text_primary'], font=('Segoe UI', 22, 'bold')).pack(anchor='w')
+        tk.Label(title, text="CISCO SDNA VERSION 1.0.0", bg=self.colors['bg_secondary'],
+                 fg=self.colors['neon_pink'], font=('Segoe UI', 12, 'bold')).pack(anchor='w')
+        status_frame = tk.Frame(header, bg=self.colors['bg_secondary'])
+        status_frame.pack(side='right', padx=40)
+        self.status_canvas = tk.Canvas(status_frame, width=20, height=20,
+                                       bg=self.colors['bg_secondary'], highlightthickness=0)
+        self.status_canvas.pack(side='left', padx=10)
+        self.status_indicator = self.status_canvas.create_oval(2, 2, 18, 18, fill=self.colors['error'])
+        self.status_var = tk.StringVar(value="⚪ Disconnected")
+        self.status_text = tk.Label(status_frame, textvariable=self.status_var,
+                                    bg=self.colors['bg_secondary'], fg=self.colors['error'],
+                                    font=('Segoe UI', 14, 'bold'))
+        self.status_text.pack(side='left')
+
+    def create_sidebar(self, parent):
+        self.sidebar = tk.Frame(parent, bg=self.colors['bg_secondary'], width=260)
+        self.sidebar.pack(side='left', fill='y', padx=(0, 20))
+        self.sidebar.pack_propagate(False)
+        self.nav_buttons = []
+        nav_items = [("⚙️ Settings", 0, 'neon_orange'), ("🔌 Connection", 1, 'neon_cyan'),
+                     ("🌐 Routing", 2, 'neon_purple'), ("⚡ Interfaces", 3, 'neon_yellow'),
+                     ("🏷️ VLAN", 4, 'neon_pink'), ("🔧 Troubleshooting", 5, 'neon_green')]
+        for text, idx, color in nav_items:
+            btn = tk.Button(self.sidebar, text=text, anchor='w', padx=25, pady=18,
+                            bg=self.colors['bg_secondary'], fg=self.colors['text_secondary'],
+                            font=('Segoe UI', 12, 'bold'), relief='flat', cursor='hand2',
+                            command=lambda x=idx: self.show_panel(x))
+            btn.pack(fill='x', pady=1)
+            btn.bind('<Enter>', lambda e, b=btn: b.config(bg=self.colors['bg_hover']))
+            btn.bind('<Leave>', lambda e, b=btn: b.config(bg=self.colors['bg_secondary']))
+            self.nav_buttons.append((btn, color))
+
+    def create_settings_panel(self):
+        panel = tk.Frame(self.main_frame, bg=self.colors['bg_primary'])
+        tk.Label(panel, text="Application Settings", bg=self.colors['bg_primary'],
+                 fg=self.colors['neon_orange'], font=('Segoe UI', 28, 'bold')).pack(anchor='w', pady=(0, 30))
+        card = Card(panel, "Appearance Settings", "🎨", 'neon_orange')
+        card.outer.pack(fill='x', pady=20)
+        content = tk.Frame(card, bg=self.colors['bg_card'], padx=40, pady=40)
+        content.pack(fill='x')
+        tk.Label(content, text="Select Theme:", bg=content['bg'],
+                 fg=self.colors['text_secondary'], font=('Segoe UI', 14)).pack(anchor='w')
+        theme_frame = tk.Frame(content, bg=content['bg'])
+        theme_frame.pack(fill='x', pady=20)
+        self.theme_var = tk.StringVar(value=self.current_theme)
+        tk.Radiobutton(theme_frame, text="🌙 Dark Mode", variable=self.theme_var, value="DARK",
+                       bg=theme_frame['bg'], fg=self.colors['text_primary'],
+                       selectcolor=self.colors['bg_input'], font=('Segoe UI', 12),
+                       command=lambda: self.apply_theme(self.theme_var.get())).pack(side='left', padx=20)
+        tk.Radiobutton(theme_frame, text="☀️ Light Mode", variable=self.theme_var, value="LIGHT",
+                       bg=theme_frame['bg'], fg=self.colors['text_primary'],
+                       selectcolor=self.colors['bg_input'], font=('Segoe UI', 12),
+                       command=lambda: self.apply_theme(self.theme_var.get())).pack(side='left', padx=20)
+        about_card = Card(panel, "About", "ℹ️", 'neon_blue')
+        about_card.outer.pack(fill='x', pady=20)
+        about_content = tk.Frame(about_card, bg=self.colors['bg_card'], padx=40, pady=20)
+        about_content.pack(fill='x')
+        about_text = """Software Name: SDNA \nVersion: 1.0.0\nVendor: Cisco IOS\nFeatures: SSH Automation, Routing Protocols, VLAN Management, Interface Configuration and Troubleshooting\n\nDeveloped by - Nazari Mohammad Mahmood - ICT-Faculty - Kabul Unniversity - Afghanistan"""
+        tk.Label(about_content, text=about_text, bg=about_content['bg'],
+                 fg=self.colors['text_secondary'], font=('Consolas', 10), justify='left').pack(anchor='w')
+        self.panels.append(panel)
+
+    def create_connection_panel(self):
+        panel = tk.Frame(self.main_frame, bg=self.colors['bg_primary'])
+        tk.Label(panel, text="Device Connection", bg=self.colors['bg_primary'],
+                 fg=self.colors['neon_cyan'], font=('Segoe UI', 28, 'bold')).pack(anchor='w', pady=(0, 20))
+        conn_card = Card(panel, "SSH Connection Parameters", "🔐", 'neon_purple')
+        conn_card.outer.pack(fill='x', pady=10)
+        form = tk.Frame(conn_card, bg=self.colors['bg_card'], padx=40, pady=20)
+        form.pack(fill='x')
+        left_col = tk.Frame(form, bg=self.colors['bg_card'])
+        left_col.pack(side='left', fill='both', expand=True)
+        right_col = tk.Frame(form, bg=self.colors['bg_card'])
+        right_col.pack(side='right', fill='both', expand=True, padx=(40, 0))
+        tk.Label(left_col, text="IP Address:", bg=left_col['bg'],
+                 fg=self.colors['text_secondary'], font=('Segoe UI', 11)).pack(anchor='w', pady=(10, 5))
+        self.entry_ip = StyledEntry(left_col, "", width=30, colors=self.colors)
+        self.entry_ip.pack(fill='x', pady=5)
+        tk.Label(left_col, text="Username:", bg=left_col['bg'],
+                 fg=self.colors['text_secondary'], font=('Segoe UI', 11)).pack(anchor='w', pady=(15, 5))
+        self.entry_user = StyledEntry(left_col, "", width=30, colors=self.colors)
+        self.entry_user.pack(fill='x', pady=5)
+        tk.Label(left_col, text="Password:", bg=left_col['bg'],
+                 fg=self.colors['text_secondary'], font=('Segoe UI', 11)).pack(anchor='w', pady=(15, 5))
+        self.entry_pass = StyledEntry(left_col, "", show="•", width=30, colors=self.colors)
+        self.entry_pass.pack(fill='x', pady=5)
+        tk.Label(right_col, text="SSH Port:", bg=right_col['bg'],
+                 fg=self.colors['text_secondary'], font=('Segoe UI', 11)).pack(anchor='w', pady=(10, 5))
+        self.entry_port = StyledEntry(right_col, "22", width=30, colors=self.colors)
+        self.entry_port.pack(fill='x', pady=5)
+        tk.Label(right_col, text="Enable Secret (Optional):", bg=right_col['bg'],
+                 fg=self.colors['text_secondary'], font=('Segoe UI', 11)).pack(anchor='w', pady=(15, 5))
+        self.entry_enable = StyledEntry(right_col, "", show="•", width=30, colors=self.colors)
+        self.entry_enable.pack(fill='x', pady=5)
+        btn_frame = tk.Frame(form, bg=self.colors['bg_card'])
+        btn_frame.pack(fill='x', pady=(20, 10))
+        self.btn_connect = StyledButton(btn_frame, "🔗 CONNECT", self.connect_device, 'neon_green', 20)
+        self.btn_connect.pack(side='left', padx=5)
+        self.btn_disconnect = StyledButton(btn_frame, "❌ DISCONNECT", self.disconnect_device, 'neon_red', 20)
+        self.btn_disconnect.pack(side='left', padx=5)
+        self.btn_disconnect.config(state='disabled')
+        log_card = Card(panel, "Connection Log", "📋", 'neon_green')
+        log_card.outer.pack(fill='both', expand=True, pady=(15, 0))
+        self.conn_log = scrolledtext.ScrolledText(log_card, bg=self.colors['bg_input'],
+                                                     fg=self.colors['text_primary'], font=('Consolas', 10),
+                                                     relief='flat', padx=10, pady=10, height=10)
+        self.conn_log.pack(fill='both', expand=True, padx=2, pady=2)
+        self.conn_log.insert('1.0', ">>> System Ready...\n>>> Waiting for connection...\n")
+        self.conn_log.config(state='disabled')
+        self.panels.append(panel)
+
+    def create_routing_panel(self):
+        panel = tk.Frame(self.main_frame, bg=self.colors['bg_primary'])
+        tk.Label(panel, text="Routing Protocols", bg=self.colors['bg_primary'],
+                 fg=self.colors['neon_purple'], font=('Segoe UI', 26, 'bold')).pack(anchor='w', pady=(0, 15))
+        nb = ttk.Notebook(panel, style='TNotebook')
+        nb.pack(fill='both', expand=True)
+        ospf = tk.Frame(nb, bg=self.colors['bg_primary'])
+        nb.add(ospf, text="   OSPF   ")
+        self.create_ospf_content(ospf)
+        eigrp = tk.Frame(nb, bg=self.colors['bg_primary'])
+        nb.add(eigrp, text="   EIGRP   ")
+        self.create_eigrp_content(eigrp)
+        rip = tk.Frame(nb, bg=self.colors['bg_primary'])
+        nb.add(rip, text="   RIPv2   ")
+        self.create_rip_content(rip)
+        static = tk.Frame(nb, bg=self.colors['bg_primary'])
+        nb.add(static, text="   STATIC   ")
+        self.create_static_content(static)
+        default = tk.Frame(nb, bg=self.colors['bg_primary'])
+        nb.add(default, text="   DEFAULT   ")
+        self.create_default_content(default)
+        self.panels.append(panel)
+
+    def create_ospf_content(self, parent):
+        container = tk.Frame(parent, bg=self.colors['bg_primary'])
+        container.pack(fill='both', expand=True)
+        card = Card(container, "OSPF Configuration", "🌐", 'neon_cyan')
+        card.outer.pack(fill='x', padx=10, pady=10)
+        content = tk.Frame(card, bg=self.colors['bg_card'], padx=40, pady=30)
+        content.pack(fill='x')
+        pframe = tk.Frame(content, bg=self.colors['bg_card'])
+        pframe.pack(fill='x')
+        tk.Label(pframe, text="Process ID:", bg=pframe['bg'],
+                 fg=self.colors['neon_cyan'], font=('Segoe UI', 11, 'bold')).pack(side='left')
+        self.ospf_pid = StyledEntry(pframe, "1", width=10, colors=self.colors)
+        self.ospf_pid.pack(side='left', padx=10)
+        tk.Label(pframe, text="Router ID:", bg=pframe['bg'],
+                 fg=self.colors['neon_cyan'], font=('Segoe UI', 11, 'bold')).pack(side='left', padx=(30, 10))
+        self.ospf_rid = StyledEntry(pframe, "", width=15, colors=self.colors)
+        self.ospf_rid.pack(side='left')
+        tk.Label(content, text="Network Advertisements:", bg=content['bg'],
+                 fg=self.colors['text_secondary'], font=('Segoe UI', 12, 'bold')).pack(anchor='w', pady=(30, 10))
+        headers = tk.Frame(content, bg=content['bg'])
+        headers.pack(fill='x')
+        for h, w in [("Network", 20), ("Wildcard", 18), ("Area", 10)]:
+            tk.Label(headers, text=h, bg=headers['bg'], fg=self.colors['text_tertiary'],
+                     font=('Segoe UI', 9), width=w).pack(side='left', padx=5)
+        self.ospf_networks = []
+        for i in range(4):
+            row = tk.Frame(content, bg=content['bg'])
+            row.pack(fill='x', pady=5)
+            net = StyledEntry(row, "", width=20, colors=self.colors)
+            net.pack(side='left', padx=5)
+            wild = StyledEntry(row, "", width=18, colors=self.colors)
+            wild.pack(side='left', padx=5)
+            area = StyledEntry(row, "0", width=10, colors=self.colors)
+            area.pack(side='left', padx=5)
+            self.ospf_networks.append((net, wild, area))
+        StyledButton(content, "⚙️ CONFIGURE OSPF", self.config_ospf, 'neon_cyan', 25).pack(pady=(30, 10))
+        del_net_card = Card(container, "Delete OSPF Network", "🗑️", 'neon_orange')
+        del_net_card.outer.pack(fill='x', padx=10, pady=10)
+        del_net_content = tk.Frame(del_net_card, bg=self.colors['bg_card'], padx=40, pady=20)
+        del_net_content.pack(fill='x')
+        tk.Label(del_net_content, text="Remove a single network from OSPF process:",
+                 bg=del_net_content['bg'], fg=self.colors['neon_orange'],
+                 font=('Segoe UI', 11, 'bold')).pack(anchor='w')
+        dframe = tk.Frame(del_net_content, bg=del_net_content['bg'])
+        dframe.pack(fill='x', pady=10)
+        tk.Label(dframe, text="PID:", bg=dframe['bg'], fg=self.colors['text_secondary']).pack(side='left')
+        self.ospf_del_net_pid = StyledEntry(dframe, "1", width=8, colors=self.colors)
+        self.ospf_del_net_pid.pack(side='left', padx=5)
+        tk.Label(dframe, text="Network:", bg=dframe['bg'], fg=self.colors['text_secondary']).pack(side='left', padx=(15,0))
+        self.ospf_del_net_net = StyledEntry(dframe, "", width=15, colors=self.colors)
+        self.ospf_del_net_net.pack(side='left', padx=5)
+        tk.Label(dframe, text="Wildcard:", bg=dframe['bg'], fg=self.colors['text_secondary']).pack(side='left', padx=(15,0))
+        self.ospf_del_net_wild = StyledEntry(dframe, "", width=15, colors=self.colors)
+        self.ospf_del_net_wild.pack(side='left', padx=5)
+        tk.Label(dframe, text="Area:", bg=dframe['bg'], fg=self.colors['text_secondary']).pack(side='left', padx=(15,0))
+        self.ospf_del_net_area = StyledEntry(dframe, "0", width=8, colors=self.colors)
+        self.ospf_del_net_area.pack(side='left', padx=5)
+        StyledButton(del_net_content, "🗑️ DELETE OSPF NETWORK", self.delete_ospf_network, 'neon_orange', 25).pack(pady=10)
+        del_rid_card = Card(container, "Delete OSPF Router-ID", "🗑️", 'neon_yellow')
+        del_rid_card.outer.pack(fill='x', padx=10, pady=10)
+        del_rid_content = tk.Frame(del_rid_card, bg=self.colors['bg_card'], padx=40, pady=20)
+        del_rid_content.pack(fill='x')
+        tk.Label(del_rid_content, text="Remove Router-ID from OSPF process:",
+                 bg=del_rid_content['bg'], fg=self.colors['neon_yellow'],
+                 font=('Segoe UI', 11, 'bold')).pack(anchor='w')
+        rid_frame = tk.Frame(del_rid_content, bg=del_rid_content['bg'])
+        rid_frame.pack(fill='x', pady=10)
+        tk.Label(rid_frame, text="Process ID:", bg=rid_frame['bg'], fg=self.colors['text_secondary']).pack(side='left')
+        self.ospf_del_rid_pid = StyledEntry(rid_frame, "1", width=10, colors=self.colors)
+        self.ospf_del_rid_pid.pack(side='left', padx=5)
+        StyledButton(rid_frame, "🗑️ DELETE ROUTER-ID", self.delete_ospf_router_id, 'neon_yellow', 20).pack(side='left', padx=(20, 0))
+        del_card = Card(container, "Delete OSPF Process", "🗑️", 'neon_red')
+        del_card.outer.pack(fill='x', padx=10, pady=10)
+        del_content = tk.Frame(del_card, bg=self.colors['bg_card'], padx=40, pady=20)
+        del_content.pack(fill='x')
+        tk.Label(del_content, text="Process ID to Delete (removes entire OSPF):",
+                 bg=del_content['bg'], fg=self.colors['neon_red'],
+                 font=('Segoe UI', 11, 'bold')).pack(anchor='w')
+        self.ospf_del_pid = StyledEntry(del_content, "1", width=10, colors=self.colors)
+        self.ospf_del_pid.pack(anchor='w', pady=5)
+        StyledButton(del_content, "🗑️ DELETE ENTIRE OSPF", self.delete_ospf, 'neon_red', 25).pack(pady=10)
+
+    def create_eigrp_content(self, parent):
+        container = tk.Frame(parent, bg=self.colors['bg_primary'])
+        container.pack(fill='both', expand=True)
+        card = Card(container, "EIGRP Configuration", "⚡", 'neon_yellow')
+        card.outer.pack(fill='x', padx=10, pady=10)
+        content = tk.Frame(card, bg=self.colors['bg_card'], padx=40, pady=30)
+        content.pack(fill='x')
+        tk.Label(content, text="Autonomous System:", bg=content['bg'],
+                 fg=self.colors['neon_yellow'], font=('Segoe UI', 12, 'bold')).pack(anchor='w')
+        self.eigrp_as = StyledEntry(content, "100", width=15, colors=self.colors)
+        self.eigrp_as.pack(anchor='w', pady=10)
+        self.eigrp_no_auto = tk.BooleanVar(value=True)
+        tk.Checkbutton(content, text="Disable Auto-Summary", variable=self.eigrp_no_auto,
+                       bg=content['bg'], fg=self.colors['text_primary'],
+                       selectcolor=self.colors['bg_input'], font=('Segoe UI', 11)).pack(anchor='w')
+        tk.Label(content, text="Networks:", bg=content['bg'],
+                 fg=self.colors['text_secondary'], font=('Segoe UI', 12, 'bold')).pack(anchor='w', pady=(20, 10))
+        self.eigrp_networks = []
+        for i in range(4):
+            row = tk.Frame(content, bg=content['bg'])
+            row.pack(fill='x', pady=5)
+            net = StyledEntry(row, "", width=25, colors=self.colors)
+            net.pack(side='left', padx=5)
+            wild = StyledEntry(row, "", width=25, colors=self.colors)
+            wild.pack(side='left', padx=5)
+            self.eigrp_networks.append((net, wild))
+        StyledButton(content, "⚙️ CONFIGURE EIGRP", self.config_eigrp, 'neon_yellow', 25).pack(pady=(30, 10))
+        del_net_card = Card(container, "Delete EIGRP Network", "🗑️", 'neon_orange')
+        del_net_card.outer.pack(fill='x', padx=10, pady=10)
+        del_net_content = tk.Frame(del_net_card, bg=self.colors['bg_card'], padx=40, pady=20)
+        del_net_content.pack(fill='x')
+        tk.Label(del_net_content, text="Remove a single network from EIGRP process:",
+                 bg=del_net_content['bg'], fg=self.colors['neon_orange'],
+                 font=('Segoe UI', 11, 'bold')).pack(anchor='w')
+        dframe = tk.Frame(del_net_content, bg=del_net_content['bg'])
+        dframe.pack(fill='x', pady=10)
+        tk.Label(dframe, text="AS:", bg=dframe['bg'], fg=self.colors['text_secondary']).pack(side='left')
+        self.eigrp_del_net_as = StyledEntry(dframe, "100", width=10, colors=self.colors)
+        self.eigrp_del_net_as.pack(side='left', padx=5)
+        tk.Label(dframe, text="Network:", bg=dframe['bg'], fg=self.colors['text_secondary']).pack(side='left', padx=(15,0))
+        self.eigrp_del_net_net = StyledEntry(dframe, "", width=20, colors=self.colors)
+        self.eigrp_del_net_net.pack(side='left', padx=5)
+        tk.Label(dframe, text="Wildcard:", bg=dframe['bg'], fg=self.colors['text_secondary']).pack(side='left', padx=(15,0))
+        self.eigrp_del_net_wild = StyledEntry(dframe, "", width=20, colors=self.colors)
+        self.eigrp_del_net_wild.pack(side='left', padx=5)
+        # FIXED: Delete button inline next to wildcard/mask
+        StyledButton(dframe, "🗑️ DELETE", self.delete_eigrp_network, 'neon_orange', 15).pack(side='left', padx=(15, 0))
+        del_card = Card(container, "Delete EIGRP Process", "🗑️", 'neon_red')
+        del_card.outer.pack(fill='x', padx=10, pady=10)
+        del_content = tk.Frame(del_card, bg=self.colors['bg_card'], padx=40, pady=20)
+        del_content.pack(fill='x')
+        tk.Label(del_content, text="AS Number to Delete (removes entire EIGRP):",
+                 bg=del_content['bg'], fg=self.colors['neon_red'],
+                 font=('Segoe UI', 11, 'bold')).pack(anchor='w')
+        self.eigrp_del_as = StyledEntry(del_content, "100", width=15, colors=self.colors)
+        self.eigrp_del_as.pack(anchor='w', pady=5)
+        StyledButton(del_content, "🗑️ DELETE ENTIRE EIGRP", self.delete_eigrp, 'neon_red', 25).pack(pady=10)
+
+    def create_rip_content(self, parent):
+        container = tk.Frame(parent, bg=self.colors['bg_primary'])
+        container.pack(fill='both', expand=True)
+        card = Card(container, "RIPv2 Configuration", "🔄", 'neon_orange')
+        card.outer.pack(fill='x', padx=10, pady=10)
+        content = tk.Frame(card, bg=self.colors['bg_card'], padx=40, pady=30)
+        content.pack(fill='x')
+        tk.Label(content, text="RIPv2 Only (Classless Routing with Auto-Summary Disabled)",
+                 bg=content['bg'], fg=self.colors['neon_orange'],
+                 font=('Segoe UI', 11, 'bold')).pack(anchor='w', pady=(0, 15))
+        tk.Label(content, text="Networks:", bg=content['bg'],
+                 fg=self.colors['text_secondary'], font=('Segoe UI', 12, 'bold')).pack(anchor='w', pady=(20, 10))
+        self.rip_networks = []
+        for i in range(4):
+            row = tk.Frame(content, bg=content['bg'])
+            row.pack(fill='x', pady=5)
+            net = StyledEntry(row, "", width=40, colors=self.colors)
+            net.pack(side='left', padx=5)
+            self.rip_networks.append(net)
+        StyledButton(content, "⚙️ CONFIGURE RIPv2", self.config_rip, 'neon_orange', 25).pack(pady=(30, 10))
+        del_net_card = Card(container, "Delete RIPv2 Network", "🗑️", 'neon_orange')
+        del_net_card.outer.pack(fill='x', padx=10, pady=10)
+        del_net_content = tk.Frame(del_net_card, bg=self.colors['bg_card'], padx=40, pady=20)
+        del_net_content.pack(fill='x')
+        tk.Label(del_net_content, text="Network to remove from RIPv2:",
+                 bg=del_net_content['bg'], fg=self.colors['neon_orange'],
+                 font=('Segoe UI', 11, 'bold')).pack(anchor='w')
+        self.rip_del_net = StyledEntry(del_net_content, "", width=30, colors=self.colors)
+        self.rip_del_net.pack(anchor='w', pady=5)
+        StyledButton(del_net_content, "🗑️ DELETE RIPv2 NETWORK", self.delete_rip_network, 'neon_orange', 25).pack(pady=10)
+        del_card = Card(container, "Delete RIPv2 Process", "🗑️", 'neon_red')
+        del_card.outer.pack(fill='x', padx=10, pady=10)
+        del_content = tk.Frame(del_card, bg=self.colors['bg_card'], padx=40, pady=20)
+        del_content.pack(fill='x')
+        tk.Label(del_content, text="This will remove the entire RIPv2 process:",
+                 bg=del_content['bg'], fg=self.colors['text_secondary'],
+                 font=('Segoe UI', 11)).pack(anchor='w')
+        StyledButton(del_content, "🗑️ DELETE ENTIRE RIPv2", self.delete_rip, 'neon_red', 25).pack(pady=10)
+
+
+    def create_static_content(self, parent):
+        container = tk.Frame(parent, bg=self.colors['bg_primary'])
+        container.pack(fill='both', expand=True)
+
+        # === ADD STATIC ROUTES CARD (ATMCRCP Style with Treeview) ===
+        card = Card(container, "Static Routes", "🛣️", 'neon_pink')
+        card.outer.pack(fill='x', padx=10, pady=10)
+        content = tk.Frame(card, bg=self.colors['bg_card'], padx=40, pady=30)
+        content.pack(fill='x')
+
+        # Treeview table for static routes
+        tree_frame = tk.Frame(content, bg=self.colors['bg_card'])
+        tree_frame.pack(fill='both', expand=True, pady=10)
+
+        columns = ('network', 'mask', 'next_hop', 'exit_intf')
+        self.static_tree = ttk.Treeview(tree_frame, columns=columns, show='headings', height=6)
+
+        self.static_tree.heading('network', text='Network')
+        self.static_tree.heading('mask', text='Subnet Mask')
+        self.static_tree.heading('next_hop', text='Next Hop IP')
+        self.static_tree.heading('exit_intf', text='Exit Interface')
+
+        self.static_tree.column('network', width=160, anchor='center')
+        self.static_tree.column('mask', width=140, anchor='center')
+        self.static_tree.column('next_hop', width=140, anchor='center')
+        self.static_tree.column('exit_intf', width=140, anchor='center')
+
+        # Scrollbar for treeview
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self.static_tree.yview)
+        self.static_tree.configure(yscrollcommand=scrollbar.set)
+
+        self.static_tree.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+
+        # Add route form (like ATMCRCP)
+        form = tk.Frame(content, bg=self.colors['bg_card'])
+        form.pack(fill='x', pady=15)
+
+        tk.Label(form, text="Network:", bg=form['bg'], fg=self.colors['text_secondary'],
+                 font=('Segoe UI', 10)).pack(side='left', padx=(0, 5))
+        self.static_net = StyledEntry(form, "", width=15, colors=self.colors)
+        self.static_net.pack(side='left', padx=5)
+
+        tk.Label(form, text="Mask:", bg=form['bg'], fg=self.colors['text_secondary'],
+                 font=('Segoe UI', 10)).pack(side='left', padx=(10, 5))
+        self.static_mask = StyledEntry(form, "", width=15, colors=self.colors)
+        self.static_mask.pack(side='left', padx=5)
+
+        tk.Label(form, text="Next-Hop:", bg=form['bg'], fg=self.colors['text_secondary'],
+                 font=('Segoe UI', 10)).pack(side='left', padx=(10, 5))
+        self.static_hop = StyledEntry(form, "", width=15, colors=self.colors)
+        self.static_hop.pack(side='left', padx=5)
+
+        StyledButton(form, "➕ ADD", self.add_static_route, 'neon_cyan', 10).pack(side='left', padx=15)
+
+        StyledButton(content, "⚙️ APPLY STATIC ROUTES", self.config_static, 'neon_pink', 25).pack(pady=(10, 10))
+
+        # === DELETE STATIC ROUTES CARD (Preserved) ===
+        del_card = Card(container, "Delete Static Routes", "🗑️", 'neon_red')
+        del_card.outer.pack(fill='x', padx=10, pady=10)
+        del_content = tk.Frame(del_card, bg=self.colors['bg_card'], padx=40, pady=20)
+        del_content.pack(fill='x')
+
+        tk.Label(del_content, text="Enter routes to delete (Network + Mask + Next-Hop required):",
+                 bg=del_content['bg'], fg=self.colors['neon_red'],
+                 font=('Segoe UI', 11, 'bold')).pack(anchor='w')
+
+        # Main horizontal layout: inputs on left (no expand), delete button on far right
+        main_del_frame = tk.Frame(del_content, bg=del_content['bg'])
+        main_del_frame.pack(fill='x', pady=(10, 0))
+
+        # Left side: headers + input rows (no expand, so right side gets pushed to edge)
+        left_inputs = tk.Frame(main_del_frame, bg=main_del_frame['bg'])
+        left_inputs.pack(side='left', fill='y')
+
+        del_headers = tk.Frame(left_inputs, bg=left_inputs['bg'])
+        del_headers.pack(fill='x', pady=(0, 5))
+        for h, w in [("Network", 20), ("Mask", 18), ("Next-Hop", 18)]:
+            tk.Label(del_headers, text=h, bg=del_headers['bg'], fg=self.colors['text_tertiary'],
+                     font=('Segoe UI', 9), width=w).pack(side='left', padx=5)
+
+        self.static_del_routes = []
+        for i in range(4):
+            row = tk.Frame(left_inputs, bg=left_inputs['bg'])
+            row.pack(fill='x', pady=5)
+            net = StyledEntry(row, "", width=20, colors=self.colors)
+            net.pack(side='left', padx=5)
+            mask = StyledEntry(row, "", width=18, colors=self.colors)
+            mask.pack(side='left', padx=5)
+            hop = StyledEntry(row, "", width=18, colors=self.colors)
+            hop.pack(side='left', padx=5)
+            self.static_del_routes.append((net, mask, hop))
+
+        # Spacer to push button to far right
+        tk.Frame(main_del_frame, bg=main_del_frame['bg']).pack(side='left', fill='both', expand=True)
+
+        # Right side: delete button on far right edge, vertically centered
+        right_btn = tk.Frame(main_del_frame, bg=main_del_frame['bg'])
+        right_btn.pack(side='right', fill='y')
+        tk.Frame(right_btn, bg=right_btn['bg']).pack(fill='both', expand=True)   # top spacer
+        StyledButton(right_btn, "🗑️ DELETE SELECTED", self.delete_static, 'neon_red', 18).pack()
+        tk.Frame(right_btn, bg=right_btn['bg']).pack(fill='both', expand=True)   # bottom spacer
+
+    def create_default_content(self, parent):
+        container = tk.Frame(parent, bg=self.colors['bg_primary'])
+        container.pack(fill='both', expand=True)
+
+        # === ADD DEFAULT ROUTE CARD (ATMCRCP Style) ===
+        card = Card(container, "Default Route (Gateway of Last Resort)", "🎯", 'neon_red')
+        card.outer.pack(fill='x', padx=10, pady=10)
+        content = tk.Frame(card, bg=self.colors['bg_card'], padx=40, pady=40)
+        content.pack(fill='x')
+
+        tk.Label(content, text="Next Hop IP Address:", bg=content['bg'],
+                 fg=self.colors['neon_red'], font=('Segoe UI', 14, 'bold')).pack(anchor='w')
+        self.default_gateway = StyledEntry(content, "", width=30, colors=self.colors)
+        self.default_gateway.pack(anchor='w', pady=15)
+
+        # Exit Interface (like ATMCRCP)
+        tk.Label(content, text="OR Exit Interface:", bg=content['bg'],
+                 fg=self.colors['text_secondary'], font=('Segoe UI', 12)).pack(anchor='w')
+        self.default_intf = ttk.Combobox(content, values=["", "FastEthernet0/0", "Gig0/0", "Gig0/1", "Serial0/0/0"],
+                                         state='readonly', font=('Segoe UI', 11))
+        self.default_intf.pack(anchor='w', pady=10, fill='x')
+        self.default_intf.set("")
+
+        tk.Label(content, text="This will create: ip route 0.0.0.0 0.0.0.0 <next-hop or interface>",
+                 bg=content['bg'], fg=self.colors['text_tertiary'], font=('Segoe UI', 10)).pack(anchor='w', pady=10)
+        StyledButton(content, "⚙️ CONFIGURE DEFAULT ROUTE", self.config_default, 'neon_red', 30).pack(pady=20)
+
+        # === DELETE DEFAULT ROUTE CARD (Preserved) ===
+        del_card = Card(container, "Delete Default Route", "🗑️", 'neon_red')
+        del_card.outer.pack(fill='x', padx=10, pady=10)
+        del_content = tk.Frame(del_card, bg=self.colors['bg_card'], padx=40, pady=20)
+        del_content.pack(fill='x')
+        tk.Label(del_content, text="Gateway or Interface to remove:", bg=del_content['bg'],
+                 fg=self.colors['neon_red'], font=('Segoe UI', 12, 'bold')).pack(anchor='w')
+        self.default_del_gateway = StyledEntry(del_content, "", width=30, colors=self.colors)
+        self.default_del_gateway.pack(anchor='w', pady=10)
+        tk.Label(del_content, text="OR select Exit Interface:", bg=del_content['bg'],
+                 fg=self.colors['text_secondary'], font=('Segoe UI', 10)).pack(anchor='w')
+        self.default_del_intf = ttk.Combobox(del_content, values=["", "FastEthernet0/0", "Gig0/0", "Gig0/1", "Serial0/0/0"],
+                                              state='readonly', font=('Segoe UI', 11))
+        self.default_del_intf.pack(anchor='w', pady=5, fill='x')
+        self.default_del_intf.set("")
+        StyledButton(del_content, "🗑️ DELETE DEFAULT ROUTE", self.delete_default, 'neon_red', 30).pack(pady=10)
+
+    def create_interface_panel(self):
+        """Create interface configuration panel with DELETE - IP input added"""
+        panel = tk.Frame(self.main_frame, bg=self.colors['bg_primary'])
+        tk.Label(panel, text="Interface Configuration", bg=self.colors['bg_primary'],
+                 fg=self.colors['neon_yellow'], font=('Segoe UI', 26, 'bold')).pack(anchor='w', pady=(0, 15))
+        card = Card(panel, "Interface Settings", "⚡", 'neon_yellow')
+        card.outer.pack(fill='both', expand=True)
+        content = tk.Frame(card, bg=self.colors['bg_card'], padx=50, pady=30)
+        content.pack(fill='both', expand=True)
+        tk.Label(content, text="Select Interface:", bg=content['bg'],
+                 fg=self.colors['neon_yellow'], font=('Segoe UI', 13, 'bold')).pack(anchor='w')
+        sframe = tk.Frame(content, bg=content['bg'])
+        sframe.pack(fill='x', pady=10)
+        self.intf_type = tk.StringVar(value="GigabitEthernet")
+        for t in ["FastEthernet", "GigabitEthernet", "Ethernet", "Serial"]:
+            tk.Radiobutton(sframe, text=t, variable=self.intf_type, value=t,
+                           bg=sframe['bg'], fg=self.colors['text_primary'],
+                           selectcolor=self.colors['bg_input'], font=('Segoe UI', 9, 'bold')).pack(side='left', padx=10)
+        nframe = tk.Frame(content, bg=content['bg'])
+        nframe.pack(fill='x', pady=5)
+        tk.Label(nframe, text="Number:", bg=nframe['bg'],
+                 fg=self.colors['text_secondary'], font=('Segoe UI', 11)).pack(side='left')
+        self.intf_num = StyledEntry(nframe, "0/0", width=10, colors=self.colors)
+        self.intf_num.pack(side='left', padx=10)
+        StyledButton(nframe, "🔌 SELECT", self.select_interface, 'neon_cyan', 12).pack(side='left')
+        self.intf_label = tk.Label(content, text="Selected: None", bg=content['bg'],
+                                   fg=self.colors['text_tertiary'], font=('Segoe UI', 12, 'bold'))
+        self.intf_label.pack(anchor='w', pady=15)
+        cfg = tk.Frame(content, bg=content['bg'])
+        cfg.pack(fill='x', pady=10)
+        left = tk.LabelFrame(cfg, text=" IP Configuration ", bg=self.colors['bg_card'],
+                             fg=self.colors['neon_cyan'], font=('Segoe UI', 11, 'bold'), padx=15, pady=15)
+        left.pack(side='left', fill='both', expand=True, padx=(0, 10))
+        tk.Label(left, text="IP Address:", bg=left['bg'], fg=self.colors['text_secondary']).pack(anchor='w')
+        self.intf_ip = StyledEntry(left, "", colors=self.colors)
+        self.intf_ip.pack(fill='x', pady=5)
+        tk.Label(left, text="Subnet Mask:", bg=left['bg'], fg=self.colors['text_secondary']).pack(anchor='w', pady=(10, 0))
+        self.intf_mask = StyledEntry(left, "", colors=self.colors)
+        self.intf_mask.pack(fill='x', pady=5)
+        right = tk.LabelFrame(cfg, text=" Switchport ", bg=self.colors['bg_card'],
+                              fg=self.colors['neon_green'], font=('Segoe UI', 11, 'bold'), padx=15, pady=15)
+        right.pack(side='right', fill='both', expand=True, padx=(10, 0))
+        self.port_mode = tk.StringVar(value="routed")
+        for text, val in [("Routed", "routed"), ("Access", "access"), ("Trunk", "trunk")]:
+            tk.Radiobutton(right, text=text, variable=self.port_mode, value=val,
+                           bg=right['bg'], fg=self.colors['text_primary'],
+                           selectcolor=self.colors['bg_input'], font=('Segoe UI', 10)).pack(anchor='w', pady=5)
+        tk.Label(right, text="VLAN:", bg=right['bg'], fg=self.colors['text_secondary']).pack(anchor='w', pady=(10, 0))
+        self.access_vlan = StyledEntry(right, "10", width=10, colors=self.colors)
+        self.access_vlan.pack(anchor='w', pady=5)
+        bframe = tk.Frame(content, bg=content['bg'])
+        bframe.pack(fill='x', pady=(20, 10))
+        StyledButton(bframe, "▶ ENABLE", lambda: self.intf_action(False), 'neon_green', 15).pack(side='left', padx=5)
+        StyledButton(bframe, "⏹ DISABLE", lambda: self.intf_action(True), 'neon_red', 15).pack(side='left', padx=5)
+        StyledButton(bframe, "💾 APPLY CONFIG", self.apply_intf_config, 'neon_yellow', 18).pack(side='right', padx=5)
+        dframe = tk.LabelFrame(content, text=" Delete / Reset Interface ", bg=self.colors['bg_card'],
+                               fg=self.colors['neon_red'], font=('Segoe UI', 11, 'bold'), padx=15, pady=15)
+        dframe.pack(fill='x', pady=(20, 10))
+        ip_del_frame = tk.Frame(dframe, bg=dframe['bg'])
+        ip_del_frame.pack(fill='x', pady=(0, 10))
+        tk.Label(ip_del_frame, text="IP to Remove:", bg=ip_del_frame['bg'],
+                 fg=self.colors['text_secondary'], font=('Segoe UI', 10)).pack(side='left')
+        self.intf_del_ip = StyledEntry(ip_del_frame, "", width=15, colors=self.colors)
+        self.intf_del_ip.pack(side='left', padx=5)
+        tk.Label(ip_del_frame, text="Mask:", bg=ip_del_frame['bg'],
+                 fg=self.colors['text_secondary'], font=('Segoe UI', 10)).pack(side='left', padx=(10, 0))
+        self.intf_del_mask = StyledEntry(ip_del_frame, "", width=15, colors=self.colors)
+        self.intf_del_mask.pack(side='left', padx=5)
+        tk.Label(ip_del_frame, text="(Leave empty to remove all IPs)", bg=ip_del_frame['bg'],
+                 fg=self.colors['text_tertiary'], font=('Segoe UI', 9)).pack(side='left', padx=10)
+        btn_del_frame = tk.Frame(dframe, bg=dframe['bg'])
+        btn_del_frame.pack(fill='x')
+        StyledButton(btn_del_frame, "🗑️ REMOVE IP ADD", self.remove_intf_ip, 'neon_red', 18).pack(side='left', padx=5)
+        StyledButton(btn_del_frame, "♻️ RESET INTERFACE", self.reset_intf, 'neon_orange', 18).pack(side='left', padx=5)
+        self.panels.append(panel)
+
+    def create_vlan_panel(self):
+        """Create VLAN management panel - SVI COMPLETELY REMOVED"""
+        panel = tk.Frame(self.main_frame, bg=self.colors['bg_primary'])
+        tk.Label(panel, text="VLAN Management", bg=self.colors['bg_primary'],
+                 fg=self.colors['neon_pink'], font=('Segoe UI', 26, 'bold')).pack(anchor='w', pady=(0, 15))
+        content = tk.Frame(panel, bg=self.colors['bg_primary'])
+        content.pack(fill='both', expand=True)
+        left = tk.Frame(content, bg=self.colors['bg_primary'])
+        left.pack(side='left', fill='both', expand=True, padx=(0, 15))
+        vcard = Card(left, "Create VLAN", "🏷️", 'neon_pink')
+        vcard.outer.pack(fill='x', pady=(0, 15))
+        vf = tk.Frame(vcard, bg=self.colors['bg_card'], padx=30, pady=25)
+        vf.pack(fill='x')
+        tk.Label(vf, text="VLAN ID:", bg=vf['bg'], fg=self.colors['text_secondary'],
+                 font=('Segoe UI', 11)).pack(anchor='w')
+        self.vlan_id = StyledEntry(vf, "10", width=15, colors=self.colors)
+        self.vlan_id.pack(anchor='w', pady=5)
+        tk.Label(vf, text="VLAN Name:", bg=vf['bg'], fg=self.colors['text_secondary'],
+                 font=('Segoe UI', 11)).pack(anchor='w', pady=(15, 5))
+        self.vlan_name = StyledEntry(vf, "USER_VLAN", colors=self.colors)
+        self.vlan_name.pack(fill='x', pady=5)
+        StyledButton(vf, "➕ CREATE VLAN", self.create_vlan, 'neon_pink', 20).pack(pady=20)
+        del_vcard = Card(left, "Delete VLAN", "🗑️", 'neon_red')
+        del_vcard.outer.pack(fill='x', pady=(0, 15))
+        dvf = tk.Frame(del_vcard, bg=self.colors['bg_card'], padx=30, pady=25)
+        dvf.pack(fill='x')
+        tk.Label(dvf, text="VLAN ID to Delete:", bg=dvf['bg'], fg=self.colors['neon_red'],
+                 font=('Segoe UI', 11, 'bold')).pack(anchor='w')
+        self.vlan_del_id = StyledEntry(dvf, "10", width=15, colors=self.colors)
+        self.vlan_del_id.pack(anchor='w', pady=5)
+        StyledButton(dvf, "🗑️ DELETE VLAN", self.delete_vlan, 'neon_red', 20).pack(pady=20)
+        right = tk.Frame(content, bg=self.colors['bg_primary'])
+        right.pack(side='right', fill='both', expand=True, padx=(15, 0))
+        lcard = Card(right, "VLAN Database", "📊", 'neon_blue')
+        lcard.outer.pack(fill='x', pady=(0, 15))
+        self.vlan_list = tk.Listbox(lcard, bg=self.colors['bg_input'], fg=self.colors['text_primary'],
+                                      font=('Consolas', 11), relief='flat', height=6,
+                                      selectbackground=self.colors['neon_cyan'])
+        self.vlan_list.pack(fill='x', expand=False, padx=2, pady=2)
+        StyledButton(lcard, "🔄 REFRESH", self.refresh_vlans, 'neon_blue', 20).pack(pady=10)
+        self.panels.append(panel)
+
+    def create_troubleshooting_panel(self):
+        """Create Troubleshooting panel"""
+        panel = tk.Frame(self.main_frame, bg=self.colors['bg_primary'])
+        tk.Label(panel, text="Troubleshooting", bg=self.colors['bg_primary'],
+                 fg=self.colors['neon_green'], font=('Segoe UI', 26, 'bold')).pack(anchor='w', pady=(0, 15))
+        content = tk.Frame(panel, bg=self.colors['bg_primary'])
+        content.pack(fill='both', expand=True)
+        left = tk.Frame(content, bg=self.colors['bg_primary'])
+        left.pack(side='left', fill='y', padx=(0, 15))
+        cmd_card = Card(left, "Show Commands", "🔧", 'neon_green')
+        cmd_card.outer.pack(fill='y', expand=True)
+        cmds = tk.Frame(cmd_card, bg=self.colors['bg_card'], padx=20, pady=20)
+        cmds.pack(fill='both', expand=True)
+        self.troubleshoot_cmds = [
+            ("📄 Running Config", "show running-config"),
+            ("🌐 OSPF Config", "show running-config | section router ospf"),
+            ("⚡ EIGRP Config", "show running-config | section router eigrp"),
+            ("🔄 RIP Config", "show running-config | section router rip"),
+            ("🛣️ Static Routes", "show running-config | include ^ip route"),
+            ("📋 IP Protocols", "show ip protocols"),
+            ("🔌 Interface Status", "show ip interface brief"),
+            ("📊 VLAN Brief", "show vlan brief"),
+        ]
+        self.cmd_buttons = []
+        for label, cmd in self.troubleshoot_cmds:
+            btn = tk.Button(cmds, text=label, command=lambda c=cmd: self.run_troubleshoot_cmd(c),
+                            bg=self.colors['bg_input'], fg=self.colors['text_primary'],
+                            font=('Segoe UI', 10), relief='flat', anchor='w', padx=10, pady=8, cursor='hand2')
+            btn.pack(fill='x', pady=2)
+            btn.bind('<Enter>', lambda e, b=btn: b.config(bg=self.colors['bg_hover']))
+            btn.bind('<Leave>', lambda e, b=btn: b.config(bg=self.colors['bg_input']))
+            self.cmd_buttons.append((btn, label, cmd))
+        custom_frame = tk.LabelFrame(cmds, text=" Custom Troubleshooting Commands ", bg=self.colors['bg_card'],
+                                     fg=self.colors['neon_cyan'], font=('Segoe UI', 10, 'bold'), padx=10, pady=10)
+        custom_frame.pack(fill='x', pady=(15, 5))
+        tk.Label(custom_frame, text="Enter Cisco IOS Command:", bg=custom_frame['bg'],
+                 fg=self.colors['text_secondary'], font=('Segoe UI', 9)).pack(anchor='w')
+        self.custom_cmd = StyledEntry(custom_frame, "", width=30, colors=self.colors)
+        self.custom_cmd.pack(fill='x', pady=5)
+        StyledButton(custom_frame, "▶ EXECUTE CUSTOM", self.run_custom_cmd, 'neon_cyan', 20).pack(fill='x', pady=5)
+        save_frame = tk.LabelFrame(cmds, text=" Save All Configurations ", bg=self.colors['bg_card'],
+                                   fg=self.colors['success'], font=('Segoe UI', 10, 'bold'), padx=10, pady=10)
+        save_frame.pack(fill='x', pady=(15, 5))
+        tk.Label(save_frame, text="Save Startup & Running Configs to files", bg=save_frame['bg'],
+                 fg=self.colors['text_secondary'], font=('Segoe UI', 9)).pack(anchor='w', pady=5)
+        StyledButton(save_frame, "💾 SAVE ALL CONFIGS", self.save_all_configs, 'neon_green', 20).pack(fill='x', pady=5)
+        StyledButton(cmds, "💾 SAVE RUNNING CONFIG (wr)", self.save_config, 'neon_blue', 20).pack(fill='x', pady=(15, 0))
+        right = tk.Frame(content, bg=self.colors['bg_primary'])
+        right.pack(side='right', fill='both', expand=True, padx=(15, 0))
+        out_card = Card(right, "Command Output", "📈", 'neon_blue')
+        out_card.outer.pack(fill='both', expand=True)
+        self.troubleshoot_output = scrolledtext.ScrolledText(out_card, bg=self.colors['bg_primary'],
+                                                             fg=self.colors['neon_green'], font=('Consolas', 11),
+                                                             relief='flat', padx=15, pady=15)
+        self.troubleshoot_output.pack(fill='both', expand=True, padx=2, pady=2)
+        self.troubleshoot_output.insert('1.0', ">>> Troubleshooting ready...\n>>> Connect to a device and select a command.\n")
+        self.troubleshoot_output.config(state='disabled')
+        self.panels.append(panel)
+
+    def create_status_bar(self):
+        bar = tk.Frame(self.root, bg=self.colors['bg_secondary'], height=40)
+        bar.pack(fill='x', side='bottom')
+        self.status_label = tk.Label(bar, text="Ready | Select Settings to configure theme",
+                                     bg=bar['bg'], fg=self.colors['text_secondary'], font=('Segoe UI', 10))
+        self.status_label.pack(side='left', padx=30)
+        self.vendor_label = tk.Label(bar, text="Vendor: Cisco IOS",
+                                     bg=bar['bg'], fg=self.colors['text_tertiary'], font=('Segoe UI', 10, 'bold'))
+        self.vendor_label.pack(side='right', padx=30)
+
+    def show_panel(self, index):
+        for panel in self.panels: panel.pack_forget()
+        self.panels[index].pack(fill='both', expand=True)
+        for i, (btn, color) in enumerate(self.nav_buttons):
+            if i == index:
+                btn.config(fg=self.colors[color], bg=self.colors['bg_card'])
+            else:
+                btn.config(fg=self.colors['text_secondary'], bg=self.colors['bg_secondary'])
+
+    def log(self, msg, level="info"):
+        if not hasattr(self, 'conn_log'): return
+        self.conn_log.config(state='normal')
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        colors_tag = {"info": self.colors['text_primary'], "success": self.colors['success'],
+                      "error": self.colors['error'], "warning": self.colors['warning']}
+        self.conn_log.tag_config(level, foreground=colors_tag.get(level, self.colors['text_primary']))
+        self.conn_log.insert('end', f"[{timestamp}] {msg}\n", level)
+        self.conn_log.see('end')
+        self.conn_log.config(state='disabled')
+
+    def connect_device(self):
+        ip = self.entry_ip.get()
+        port = self.entry_port.get() or "22"
+        user = self.entry_user.get()
+        pwd = self.entry_pass.get()
+        enable = self.entry_enable.get()
+        if not all([ip, user, pwd]):
+            messagebox.showerror("Error", "Please fill in IP, Username and Password")
+            return
+        device = Device(ip=ip, username=user, password=pwd, enable_secret=enable, port=int(port))
+        self.log(f"Connecting to {ip}...", "info")
+        def connect_thread():
+            success, msg = self.ssh.connect(device)
+            self.root.after(0, lambda: self.handle_connection_result(success, msg, device))
+        threading.Thread(target=connect_thread, daemon=True).start()
+
+    def handle_connection_result(self, success, msg, device):
+        if success:
+            self.log(msg, "success")
+            self.status_var.set("🟢 Connected")
+            self.status_canvas.itemconfig(self.status_indicator, fill=self.colors['success'])
+            self.btn_connect.config(state='disabled')
+            self.btn_disconnect.config(state='normal')
+            self.status_label.config(text=f"Connected: {device.hostname}")
+        else:
+            self.log(msg, "error")
+            self.status_var.set("🔴 Failed")
+            messagebox.showerror("Connection Failed", msg)
+
+    def disconnect_device(self):
+        self.ssh.disconnect()
+        self.status_var.set("⚪ Disconnected")
+        self.status_canvas.itemconfig(self.status_indicator, fill=self.colors['error'])
+        self.btn_connect.config(state='normal')
+        self.btn_disconnect.config(state='disabled')
+        self.status_label.config(text="Ready | Waiting for connection")
+        self.log("Disconnected", "warning")
+
+    def check_connection(self):
+        if not self.ssh.device or not self.ssh.device.is_connected:
+            messagebox.showerror("Error", "Not connected to any device!")
+            return False
+        return True
+
+    def exec_config(self, name, commands):
+        if not self.check_connection(): return
+        if not commands:
+            messagebox.showwarning("Notice", "No commands to execute")
+            return
+        self.log(f"Applying {name}...", "info")
+        def config_thread():
+            success, output = self.ssh.config_set(commands)
+            self.root.after(0, lambda: self.handle_config_result(success, output, name))
+        threading.Thread(target=config_thread, daemon=True).start()
+
+    def handle_config_result(self, success, output, name):
+        if success:
+            self.log(f"✅ {name} success", "success")
+            self.show_output(f"\n{'='*50}\n{name} Output:\n{'='*50}\n{output}")
+            messagebox.showinfo("Success", f"{name} configured successfully!")
+        else:
+            self.log(f"❌ {name} failed", "error")
+            messagebox.showerror("Error", f"Failed: {output}")
+
+    def show_output(self, text):
+        self.troubleshoot_output.config(state='normal')
+        self.troubleshoot_output.insert('end', text + "\n")
+        self.troubleshoot_output.see('end')
+        self.troubleshoot_output.config(state='disabled')
+
+
+    def config_ospf(self):
+        networks = [(n.get(), w.get(), a.get()) for n, w, a in self.ospf_networks if n.get().strip() and w.get().strip()]
+        if not networks:
+            messagebox.showerror("Error", "Please enter at least one network with wildcard mask")
+            return
+        cmds = CommandGenerator.configure_ospf(self.ospf_pid.get(), self.ospf_rid.get(), networks)
+        self.exec_config("OSPF", cmds)
+
+    def delete_ospf(self):
+        pid = self.ospf_del_pid.get().strip()
+        if not pid:
+            messagebox.showerror("Error", "Please enter OSPF Process ID to delete")
+            return
+        if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete OSPF process {pid}?"):
+            cmds = CommandGenerator.delete_ospf(pid)
+            self.exec_config("Delete OSPF", cmds)
+
+    def delete_ospf_network(self):
+        pid = self.ospf_del_net_pid.get().strip()
+        net = self.ospf_del_net_net.get().strip()
+        wild = self.ospf_del_net_wild.get().strip()
+        area = self.ospf_del_net_area.get().strip()
+        if not all([pid, net, wild]):
+            messagebox.showerror("Error", "Please enter PID, Network, and Wildcard")
+            return
+        if messagebox.askyesno("Confirm Delete", f"Remove network {net} {wild} area {area} from OSPF {pid}?"):
+            cmds = CommandGenerator.delete_ospf_network(pid, net, wild, area)
+            self.exec_config("Delete OSPF Network", cmds)
+
+    def delete_ospf_router_id(self):
+        """Delete Router-ID from OSPF process"""
+        pid = self.ospf_del_rid_pid.get().strip()
+        if not pid:
+            messagebox.showerror("Error", "Please enter OSPF Process ID")
+            return
+        if messagebox.askyesno("Confirm Delete", f"Remove Router-ID from OSPF process {pid}?"):
+            cmds = CommandGenerator.delete_ospf_router_id(pid)
+            self.exec_config("Delete OSPF Router-ID", cmds)
+
+    # ==================== EIGRP ====================
+    def config_eigrp(self):
+        networks = [(n.get(), w.get()) for n, w in self.eigrp_networks if n.get().strip() and w.get().strip()]
+        if not networks:
+            messagebox.showerror("Error", "Please enter at least one network with wildcard mask")
+            return
+        cmds = CommandGenerator.configure_eigrp(self.eigrp_as.get(), networks, self.eigrp_no_auto.get())
+        self.exec_config("EIGRP", cmds)
+
+    def delete_eigrp(self):
+        as_num = self.eigrp_del_as.get().strip()
+        if not as_num:
+            messagebox.showerror("Error", "Please enter EIGRP AS Number to delete")
+            return
+        if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete EIGRP AS {as_num}?"):
+            cmds = CommandGenerator.delete_eigrp(as_num)
+            self.exec_config("Delete EIGRP", cmds)
+
+    def delete_eigrp_network(self):
+        as_num = self.eigrp_del_net_as.get().strip()
+        net = self.eigrp_del_net_net.get().strip()
+        wild = self.eigrp_del_net_wild.get().strip()
+        if not all([as_num, net, wild]):
+            messagebox.showerror("Error", "Please enter AS Number, Network, and Wildcard")
+            return
+        if messagebox.askyesno("Confirm Delete", f"Remove network {net} {wild} from EIGRP AS {as_num}?"):
+            cmds = CommandGenerator.delete_eigrp_network(as_num, net, wild)
+            self.exec_config("Delete EIGRP Network", cmds)
+
+    # ==================== RIPv2 ====================
+    def config_rip(self):
+        networks = [n.get() for n in self.rip_networks if n.get().strip()]
+        if not networks:
+            messagebox.showerror("Error", "Please enter at least one network")
+            return
+        cmds = CommandGenerator.configure_rip(networks)
+        self.exec_config("RIPv2", cmds)
+
+    def delete_rip(self):
+        if messagebox.askyesno("Confirm Delete", "Are you sure you want to delete the entire RIPv2 process?"):
+            cmds = CommandGenerator.delete_rip()
+            self.exec_config("Delete RIPv2", cmds)
+
+    def delete_rip_network(self):
+        net = self.rip_del_net.get().strip()
+        if not net:
+            messagebox.showerror("Error", "Please enter network to delete")
+            return
+        if messagebox.askyesno("Confirm Delete", f"Remove network {net} from RIPv2?"):
+            cmds = CommandGenerator.delete_rip_network(net)
+            self.exec_config("Delete RIPv2 Network", cmds)
+
+    # ==================== STATIC (ATMCRCP Style) ====================
+    def add_static_route(self):
+        """Add route to Treeview table (ATMCRCP style)"""
+        net = self.static_net.get().strip()
+        mask = self.static_mask.get().strip()
+        hop = self.static_hop.get().strip()
+        if not net or not mask or not hop:
+            messagebox.showerror("Error", "Please fill in Network, Mask, and Next-Hop")
+            return
+        self.static_tree.insert('', 'end', values=(net, mask, hop, ''))
+        # Clear entries after adding
+        self.static_net.clear()
+        self.static_mask.clear()
+        self.static_hop.clear()
+
+    def config_static(self):
+        """Apply static routes from Treeview (ATMCRCP style)"""
+        if not self.check_connection(): return
+        commands = []
+        for item in self.static_tree.get_children():
+            values = self.static_tree.item(item, 'values')
+            if values[3] and values[3].strip():  # Exit interface specified
+                commands.append(f"ip route {values[0]} {values[1]} {values[3]}")
+            else:
+                commands.append(f"ip route {values[0]} {values[1]} {values[2]}")
+        if not commands:
+            messagebox.showwarning("Notice", "No routes in the table to apply")
+            return
+        self.exec_config("Static Routes", commands)
+
+    def delete_static(self):
+        """Delete static routes (preserved from original)"""
+        routes = [(n.get(), m.get(), h.get()) for n, m, h in self.static_del_routes if n.get().strip() and h.get().strip()]
+        if not routes:
+            messagebox.showerror("Error", "Please enter at least one route to delete")
+            return
+        if messagebox.askyesno("Confirm Delete", f"Delete {len(routes)} static route(s)?"):
+            cmds = CommandGenerator.delete_static(routes)
+            self.exec_config("Delete Static Routes", cmds)
+
+    # ==================== DEFAULT (ATMCRCP Style) ====================
+    def config_default(self):
+        """Configure default route with Next-Hop OR Exit Interface (ATMCRCP style)"""
+        gateway = self.default_gateway.get().strip()
+        intf = self.default_intf.get().strip()
+        if not gateway and not intf:
+            messagebox.showerror("Error", "Enter default gateway or select exit interface")
+            return
+        cmds = CommandGenerator.configure_default(gateway, intf)
+        self.exec_config("Default Route", cmds)
+
+    def delete_default(self):
+        """Delete default route with Next-Hop OR Exit Interface"""
+        gateway = self.default_del_gateway.get().strip()
+        intf = self.default_del_intf.get().strip()
+        if not gateway and not intf:
+            messagebox.showerror("Error", "Enter gateway or select exit interface to delete")
+            return
+        if messagebox.askyesno("Confirm Delete", f"Delete default route via {gateway or intf}?"):
+            cmds = CommandGenerator.delete_default(gateway, intf)
+            self.exec_config("Delete Default Route", cmds)
+
+    # ==================== INTERFACE ====================
+    def select_interface(self):
+        intf = f"{self.intf_type.get()}{self.intf_num.get()}"
+        self.current_interface = intf
+        self.intf_label.config(text=f"Selected: {intf}", fg=self.colors['neon_cyan'])
+        self.log(f"Interface selected: {intf}", "info")
+
+    def intf_action(self, shutdown):
+        if not self.current_interface:
+            messagebox.showerror("Error", "Select interface first")
+            return
+        cmds = CommandGenerator.interface_shutdown(self.current_interface, shutdown)
+        action = "Shutdown" if shutdown else "No Shutdown"
+        self.exec_config(f"Interface {action}", cmds)
+
+    def apply_intf_config(self):
+        if not self.current_interface:
+            messagebox.showerror("Error", "Select interface first")
+            return
+        cmds = CommandGenerator.configure_interface(self.current_interface, self.port_mode.get(),
+                                                     self.intf_ip.get(), self.intf_mask.get(), self.access_vlan.get())
+        self.exec_config("Interface Config", cmds)
+
+    def remove_intf_ip(self):
+        if not self.current_interface:
+            messagebox.showerror("Error", "Select interface first")
+            return
+        ip = self.intf_del_ip.get().strip()
+        mask = self.intf_del_mask.get().strip()
+        if ip and mask:
+            if messagebox.askyesno("Confirm Delete", f"Remove IP {ip} {mask} from {self.current_interface}?"):
+                cmds = CommandGenerator.delete_interface_ip_specific(self.current_interface, ip, mask)
+                self.exec_config("Remove Interface IP", cmds)
+        else:
+            if messagebox.askyesno("Confirm Delete", f"Remove all IP addresses from {self.current_interface}?"):
+                cmds = CommandGenerator.delete_interface_ip(self.current_interface)
+                self.exec_config("Remove Interface IP", cmds)
+
+    def reset_intf(self):
+        if not self.current_interface:
+            messagebox.showerror("Error", "Select interface first")
+            return
+        if messagebox.askyesno("Confirm Reset", f"Reset {self.current_interface} to factory defaults?"):
+            cmds = CommandGenerator.reset_interface(self.current_interface)
+            self.exec_config("Reset Interface", cmds)
+
+    # ==================== VLAN ====================
+    def create_vlan(self):
+        cmds = CommandGenerator.create_vlan(self.vlan_id.get(), self.vlan_name.get())
+        self.exec_config(f"VLAN {self.vlan_id.get()}", cmds)
+
+    def delete_vlan(self):
+        vid = self.vlan_del_id.get().strip()
+        if not vid:
+            messagebox.showerror("Error", "Please enter VLAN ID to delete")
+            return
+        if messagebox.askyesno("Confirm Delete", f"Are you sure you want to delete VLAN {vid}?"):
+            cmds = CommandGenerator.delete_vlan(vid)
+            self.exec_config(f"Delete VLAN {vid}", cmds)
+
+    def refresh_vlans(self):
+        if not self.check_connection(): return
+        cmd = "show vlan brief"
+        success, output = self.ssh.execute(cmd)
+        if success:
+            self.vlan_list.delete(0, 'end')
+            lines = output.split('\n')
+            for line in lines[2:]:
+                if line.strip(): self.vlan_list.insert('end', line.strip())
+            self.log("VLAN list refreshed", "success")
+        else:
+            self.log("Failed to refresh VLANs", "error")
+
+    # ==================== TROUBLESHOOTING ====================
+    def run_troubleshoot_cmd(self, cmd):
+        if not self.check_connection(): return
+        def troubleshoot_thread():
+            success, output = self.ssh.execute(cmd)
+            self.root.after(0, lambda: self.update_troubleshoot_output(success, output, cmd))
+        threading.Thread(target=troubleshoot_thread, daemon=True).start()
+
+    def run_custom_cmd(self):
+        cmd = self.custom_cmd.get().strip()
+        if not cmd:
+            messagebox.showerror("Error", "Please enter a command")
+            return
+        self.run_troubleshoot_cmd(cmd)
+
+    def update_troubleshoot_output(self, success, output, cmd):
+        self.troubleshoot_output.config(state='normal')
+        self.troubleshoot_output.delete('1.0', 'end')
+        self.troubleshoot_output.insert('1.0', f"Command: {cmd}\n{'='*60}\n\n{output if success else 'Error: ' + output}")
+        self.troubleshoot_output.config(state='disabled')
+
+    def save_config(self):
+        if not self.check_connection(): return
+        cmd = CommandGenerator.save_config()
+        success, output = self.ssh.execute(cmd)
+        if success:
+            self.log("Configuration saved", "success")
+            messagebox.showinfo("Success", "Configuration saved to device!")
+        else:
+            messagebox.showerror("Error", "Failed to save configuration")
+
+    def save_all_configs(self):
+        if not self.check_connection(): return
+        device = self.ssh.device
+        if not device:
+            messagebox.showerror("Error", "No device connected")
+            return
+        save_dir = filedialog.askdirectory(title="Select Directory to Save Configs")
+        if not save_dir: return
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        hostname = device.hostname if device.hostname else device.ip.replace(".", "_")
+        try:
+            self.log("Retrieving startup-config...", "info")
+            success_start, startup_config = self.ssh.execute("show startup-config")
+            self.log("Retrieving running-config...", "info")
+            success_run, running_config = self.ssh.execute("show running-config")
+            files_saved = []
+            if success_start:
+                startup_filename = os.path.join(save_dir, f"{hostname}_startup_config_{timestamp}.txt")
+                with open(startup_filename, 'w', encoding='utf-8') as f:
+                    f.write(f"=== STARTUP CONFIG ===\nDevice: {hostname} ({device.ip})\nTimestamp: {datetime.now().isoformat()}\n{'='*50}\n\n")
+                    f.write(startup_config)
+                files_saved.append(startup_filename)
+                self.log(f"Startup config saved: {startup_filename}", "success")
+            else:
+                self.log("Failed to retrieve startup-config", "error")
+            if success_run:
+                running_filename = os.path.join(save_dir, f"{hostname}_running_config_{timestamp}.txt")
+                with open(running_filename, 'w', encoding='utf-8') as f:
+                    f.write(f"=== RUNNING CONFIG ===\nDevice: {hostname} ({device.ip})\nTimestamp: {datetime.now().isoformat()}\n{'='*50}\n\n")
+                    f.write(running_config)
+                files_saved.append(running_filename)
+                self.log(f"Running config saved: {running_filename}", "success")
+            else:
+                self.log("Failed to retrieve running-config", "error")
+            if files_saved:
+                messagebox.showinfo("Success", f"Saved {len(files_saved)} configuration file(s) to:\n{save_dir}")
+            else:
+                messagebox.showerror("Error", "Failed to save any configuration files")
+        except Exception as e:
+            messagebox.showerror("Error", f"Error saving configs: {str(e)}")
+            self.log(f"Save All Configs failed: {str(e)}", "error")
+
+
+def main():
+    root = tk.Tk()
+    try:
+        from ctypes import windll
+        windll.shcore.SetProcessDpiAwareness(1)
+    except: pass
+    try: root.iconbitmap('network.ico')
+    except: pass
+    app = CiscoProApp(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
